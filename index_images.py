@@ -6,22 +6,20 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import faiss
 import numpy as np
+from pymongo import MongoClient
+import json
 
 print("Loading ResNet18 model...")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load ResNet18 pretrained
 base_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-
-# Bỏ lớp fully connected cuối, chỉ lấy feature vector
 model = torch.nn.Sequential(*list(base_model.children())[:-1])
 model.eval()
 model.to(device)
 
 print("Model loaded")
 
-# Preprocess ảnh
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -35,55 +33,86 @@ def extract_feature(image: Image.Image) -> np.ndarray:
     image_tensor = transform(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        feature = model(image_tensor)   # shape: [1, 512, 1, 1]
+        feature = model(image_tensor)
 
-    feature = feature.view(feature.size(0), -1)  # [1, 512]
+    feature = feature.view(feature.size(0), -1)
     feature = feature.cpu().numpy().astype("float32")
-
-    # Normalize để dùng cosine similarity với FAISS IndexFlatIP
     faiss.normalize_L2(feature)
-
     return feature[0]
 
+# =========================
+# KẾT NỐI MONGODB
+# =========================
+MONGO_URI = "mongodb+srv://quangtk205_db_user:uA4N937qK7EaThcm@thuc-tap-tot-nghiep-tha.gb1v5qc.mongodb.net/Graduation-Internship"
+DB_NAME = "Graduation-Internship"
+COLLECTION_NAME = "products"
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
+
 vectors = []
-valid_urls = []
+metadata = []
 
-with open("image_urls.txt", "r", encoding="utf-8") as f:
-    urls = [line.strip() for line in f if line.strip()]
+# Nếu ảnh là đường dẫn tương đối /media/... thì cần base domain
+BASE_IMAGE_URL = "https://tttn-he-thong-luu-tru.onrender.com/"
 
-print("Total images:", len(urls))
+products = collection.find({}, {
+    "_id": 1,
+    "name": 1,
+    "slug": 1,
+    "images.url": 1
+})
 
-for url in urls:
-    print("Processing:", url)
+for product in products:
+    product_id = str(product["_id"])
+    product_name = product.get("name", "")
+    slug = product.get("slug", "")
+    images = product.get("images", [])
 
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
+    for img in images:
+        raw_url = img.get("url")
+        if not raw_url:
+            continue
 
-        image = Image.open(BytesIO(response.content)).convert("RGB")
-        vector = extract_feature(image)
+        image_url = raw_url
+        if raw_url.startswith("/"):
+            image_url = BASE_IMAGE_URL + raw_url
 
-        vectors.append(vector)
-        valid_urls.append(url)
+        print(f"Processing product_id={product_id} | url={image_url}")
 
-    except Exception as e:
-        print(f"Skip {url}: {e}")
+        try:
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+            vector = extract_feature(image)
+
+            vectors.append(vector)
+            metadata.append({
+                "product_id": product_id,
+                "product_name": product_name,
+                "slug": slug,
+                "image_url": image_url
+            })
+
+        except Exception as e:
+            print(f"Skip {image_url}: {e}")
 
 if len(vectors) == 0:
     raise ValueError("Không có ảnh hợp lệ để tạo index.")
 
 vectors = np.array(vectors).astype("float32")
-
 print("Vector matrix shape:", vectors.shape)
 
 dimension = vectors.shape[1]
-
-# Dùng Inner Product sau khi normalize -> tương đương cosine similarity
 index = faiss.IndexFlatIP(dimension)
 index.add(vectors)
 
 faiss.write_index(index, "product_index.faiss")
-np.save("image_urls.npy", np.array(valid_urls))
+
+with open("image_metadata.json", "w", encoding="utf-8") as f:
+    json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 print("Index created successfully!")
-print("Saved image_urls.npy successfully!")
+print("Saved image_metadata.json successfully!")
