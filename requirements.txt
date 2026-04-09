@@ -6,3 +6,5 @@ faiss-cpu
 fastapi
 uvicorn
 python-multipart
+numpy
+requests
